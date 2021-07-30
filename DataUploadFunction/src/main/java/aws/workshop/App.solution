@@ -1,0 +1,214 @@
+package aws.workshop;
+
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.S3Event;
+import com.amazonaws.services.lambda.runtime.events.models.s3.S3EventNotification;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.dynamodb.DynamoDbClient;
+import software.amazon.awssdk.services.dynamodb.model.*;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.*;
+
+/**
+ * Esta función será invocada a través de eventos generados por el bucket de Amazon Simple Storage Service que fue
+ * configurado en el template. Para definir la función debemos implementar la interfaz
+ * <code>{@link com.amazonaws.services.lambda.runtime.RequestHandler}</code> y definir la entrada de la función como
+ * <code>{@link com.amazonaws.services.lambda.runtime.events.S3Event}</code> así como la salida como
+ * <code>{@link String}</code>.
+ */
+public class App implements RequestHandler<S3Event, String> {
+    /** Logger. */
+    private static final Logger LOGGER = LoggerFactory.getLogger(App.class);
+    /** Nombre del bucket de destino. */
+    private static final String DESTINATION_BUCKET = System.getenv("DESTINATION_BUCKET");
+    /** Limite de items en peticiones de DynamoDB batch. */
+    private static final int ITEM_LIMIT = 100;
+    /** Nombre de la tabla de DynamoDB donde se encuentra la bóveda de tokens. */
+    private static final String TOKEN_VAULT_TABLE = System.getenv("TOKEN_VAULT_TABLE");
+    /** Cliente de Amazon DynamoDB. */
+    private static final DynamoDbClient dynamoDbClient = DynamoDbClient.create();
+    /** Cliente de Amazon Simple Storage Service. */
+    private static final S3Client s3Client = S3Client.create();
+    /** Mapa utilizado como cache. */
+    private final Map<String, String> accountsTokens = Collections.synchronizedMap(new HashMap<>());
+
+    /**
+     * Handles a Lambda Function request
+     *
+     * @param input   The Lambda Function input
+     * @param context The Lambda execution environment context object.
+     * @return The Lambda Function output
+     */
+    @Override
+    public String handleRequest(final S3Event input, final Context context) {
+        LOGGER.debug("Iniciando ejecución");
+        // Iteramos sobre los registros.
+        try {
+            for (final S3EventNotification.S3EventNotificationRecord record: input.getRecords()) {
+                LOGGER.debug("Procesando archivo " + record.getS3().getObject().getKey());
+                processFile(record.getS3().getBucket().getName(), record.getS3().getObject().getKey());
+            }
+        } catch (final IOException ex) {
+            LOGGER.error("Error processing file", ex);
+            throw new RuntimeException("Error processing file", ex);
+        }
+        return null;
+    }
+
+    /**
+     * Procesa el archivo cargado en el bucket de S3.
+     * @param bucket Nombre del bucket de S3.
+     * @param key    Llave del objeto a procesar.
+     */
+    private void processFile(final String bucket, final String key) throws IOException {
+        LOGGER.debug("Procesando archivo " + bucket + key);
+        final String fileName = System.getProperty("java.io.tmpdir") + "/" + UUID.randomUUID() + ".csv";
+        final String uploadFileName = System.getProperty("java.io.tmpdir") + "/" + UUID.randomUUID() + ".csv";
+        final GetObjectResponse getObjectResponse = s3Client.getObject(
+                GetObjectRequest.builder()
+                        .bucket(bucket)
+                        .key(key)
+                        .build(),
+                Path.of(fileName)
+        );
+        LOGGER.debug("Respuesta getObject: " + getObjectResponse);
+        try (
+                final FileReader fileReader = new FileReader(fileName);
+                final BufferedReader reader = new BufferedReader(fileReader);
+                final FileWriter fileWriter = new FileWriter(uploadFileName);
+                final BufferedWriter writer = new BufferedWriter(fileWriter)
+                ) {
+            writer.append(reader.readLine().replace("account", "token"));
+            String line = reader.readLine();
+            final List<String[]> linesCache = new LinkedList<>();
+            final Set<String> accounts = new HashSet<>(ITEM_LIMIT);
+            while (line != null) {
+                final String[] fields = line.split(",");
+                accounts.add(fields[1]);
+                linesCache.add(fields);
+                if (accounts.size() == ITEM_LIMIT) {
+                    writeLines(writer, linesCache, accounts);
+                }
+                line = reader.readLine();
+            }
+            if (!linesCache.isEmpty() && !accounts.isEmpty()) {
+                writeLines(writer, linesCache, accounts);
+            }
+        }
+        final PutObjectResponse putObjectResponse = s3Client.putObject(
+                PutObjectRequest.builder()
+                        .bucket(DESTINATION_BUCKET)
+                        .key(key)
+                        .build(),
+                Path.of(uploadFileName)
+        );
+        LOGGER.debug("Respuesta: " + putObjectResponse);
+        Files.deleteIfExists(Path.of(fileName));
+        Files.deleteIfExists(Path.of(uploadFileName));
+    }
+
+    /**
+     * Escribe las lineas en el cache al archivo temporal.
+     *
+     * @param writer     Escritor al archivo temporal.
+     * @param linesCache Cache de líneas.
+     * @param accounts   Cuentas.
+     * @throws IOException En caso de errores al escribir el archivo.
+     */
+    private void writeLines(BufferedWriter writer, List<String[]> linesCache, Set<String> accounts) throws IOException {
+        tokenizeAccounts(accounts);
+        for (final String[] cachedFields: linesCache) {
+            writer.append(cachedFields[0])
+                    .append(',')
+                    .append(accountsTokens.get(cachedFields[1]))
+                    .append(',')
+                    .append(cachedFields[2])
+                    .append(',')
+                    .append(cachedFields[3])
+                    .append(',')
+                    .append(cachedFields[4])
+                    .append('\n');
+        }
+        accounts.clear();
+        linesCache.clear();
+    }
+
+    /**
+     * Función para tokenizar las cuentas. Esta función se asegura que la cuenta se encuentre en el cache.
+     *
+     * @param accounts Set con las cuentas a tokenizar.
+     * @return Mapa con la cuenta y su token.
+     */
+    private void tokenizeAccounts(final Set<String> accounts) {
+        final Set<String> tempAccounts = new HashSet<>(accounts);
+        final List<Map<String, AttributeValue>> keys = new ArrayList<>(ITEM_LIMIT);
+        Iterator<String> tempAccountsIt = tempAccounts.iterator();
+        while (tempAccountsIt.hasNext()) {
+            final String account = tempAccountsIt.next();
+            if (accountsTokens.containsKey(account)) {
+                tempAccountsIt.remove();
+            } else {
+                keys.add(Map.of("account", AttributeValue.builder().s(account).build()));
+            }
+        }
+        // Revisamos si existen cuentas sin token.
+        if (!keys.isEmpty()) {
+            final Map<String, KeysAndAttributes> requestItems = Map.of(TOKEN_VAULT_TABLE, KeysAndAttributes.builder()
+                    .consistentRead(true)
+                    .keys(keys)
+                    .build());
+            final BatchGetItemResponse batchGetItemResponse = dynamoDbClient.batchGetItem(
+                    BatchGetItemRequest.builder()
+                            .requestItems(requestItems)
+                            .build()
+            );
+            if (batchGetItemResponse.hasResponses()) {
+                for (final Map<String, AttributeValue> item: batchGetItemResponse.responses().get(TOKEN_VAULT_TABLE)) {
+                    tempAccounts.remove(item.get("account").s());
+                    accountsTokens.put(item.get("account").s(), item.get("token").s());
+                }
+            }
+            if (!tempAccounts.isEmpty()) {
+                final int batches = (int) Math.ceil(tempAccounts.size() / 25);
+                for (int idx = 0; idx < batches; idx++) {
+                    int count = 0;
+                    final List<WriteRequest> writeRequests = new LinkedList<>();
+                    final Map<String, List<WriteRequest>> items = Map.of(TOKEN_VAULT_TABLE, writeRequests);
+                    tempAccountsIt = tempAccounts.iterator();
+                    while (tempAccountsIt.hasNext()) {
+                        final String account = tempAccountsIt.next();
+                        final String token = UUID.randomUUID().toString();
+                        accountsTokens.put(account, token);
+                        writeRequests.add(WriteRequest.builder()
+                                .putRequest(PutRequest.builder()
+                                        .item(Map.of("account", AttributeValue.builder().s(account).build(),
+                                                "token", AttributeValue.builder().s(token).build()))
+                                        .build())
+                                .build());
+                        ++count;
+                        tempAccountsIt.remove();
+                        if (count == 25) {
+                            break;
+                        }
+                    }
+                    final BatchWriteItemResponse batchWriteItemResponse = dynamoDbClient.batchWriteItem(
+                            BatchWriteItemRequest.builder()
+                                    .requestItems(items)
+                                    .build()
+                    );
+                    LOGGER.debug("Respuesta de batch write: " + batchWriteItemResponse);
+                }
+            }
+        }
+    }
+}

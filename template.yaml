@@ -1,0 +1,20 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  serverless-workshop
+
+  Serverless Application Model template, this template will create the resources needed during the workshop.
+Globals:
+  Function:
+    Timeout: 20
+
+Parameters:
+  TokensTableName:
+    Type: String
+    Description: Name of the DynamoDB table used to store the Tokens.
+    Default: TokenVault
+  KeyAdminUser:
+    Type: String
+    Description: User that manages the customer master keys (CMK).
+
+Resources:

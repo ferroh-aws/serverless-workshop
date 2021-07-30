@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  serverless-workshop
+
+  Serverless Application Model template, this template will create the resources needed during the workshop.
+Globals:
+  Function:
+    Timeout: 20
+
+Parameters:
+  TokensTableName:
+    Type: String
+    Description: Name of the DynamoDB table used to store the Tokens.
+    Default: TokenVault
+  KeyAdminUser:
+    Type: String
+    Description: User that manages the customer master keys (CMK).
+
+Resources:
+  FailuresDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: WorkshopDLQ
+  DataUploadFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Description: Role used by the DataUploadFunction.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - s3:GetObject
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::serverless-upload-${AWS::AccountId}/*'
+              - Action:
+                  - s3:PutObject
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::serverless-destination-${AWS::AccountId}/*'
+              - Action:
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TokensTableName}'
+      RoleName: DataUploadFunctionRole
+  DataReplicationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Description: Role used by the DataReplicationFunction.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - s3:PutObject
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:s3:::serverless-destination-${AWS::AccountId}/*'
+              - Action:
+                  - sqs:SendMessage
+                Effect: Allow
+                Resource:
+                  - !GetAtt FailuresDLQ.Arn
+              - Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                Effect: Allow
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${TokensTableName}/stream/*'
+              - Action:
+                  - dynamodb:ListShards
+                  - dynamodb:ListStreams
+                Effect: Allow
+                Resource: '*'
+      RoleName: DataReplicationFunctionRole
+  DataUploadKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Symmetric key for S3 bucket encryption.
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 10
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default
+        Statement:
+          - Sid: Account Root
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':root'
+            Action:
+              - kms:*
+            Resource: '*'
+          - Sid: Administrators Access
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':user/'
+                    - Ref: KeyAdminUser
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DataUploadFunctionRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+  DataDestinationKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Symmetric key used for the S3 bucket encryption.
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 10
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default
+        Statement:
+          - Sid: Account Root
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Administrators Access
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':user/'
+                    - Ref: KeyAdminUser
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DataReplicationFunctionRole.Arn
+                - !GetAtt DataUploadFunctionRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+  TokenVaultKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Symmetric key used to encrypt data at rest in DynamoDB.
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 10
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default
+        Statement:
+          - Sid: Account Root
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Administrators Access
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':user/'
+                    - Ref: KeyAdminUser
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DataReplicationFunctionRole.Arn
+                - !GetAtt DataUploadFunctionRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+  SensibleDataKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Symmetric key used to encrypt data at rest in DynamoDB.
+      Enabled: true
+      EnableKeyRotation: true
+      PendingWindowInDays: 10
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: key-default
+        Statement:
+          - Sid: Account Root
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Administrators Access
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Join:
+                  - ''
+                  - - 'arn:aws:iam::'
+                    - Ref: AWS::AccountId
+                    - ':user/'
+                    - Ref: KeyAdminUser
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: '*'
+          - Sid: Allow use of the key
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DataReplicationFunctionRole.Arn
+                - !GetAtt DataUploadFunctionRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+  DataUploadBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt DataUploadKey.Arn
+      BucketName: !Sub 'serverless-upload-${AWS::AccountId}'
+  DataDestinationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: true
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt DataDestinationKey.Arn
+      BucketName: !Sub 'serverless-destination-${AWS::AccountId}'
+  TokenVaultTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: account
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: account
+          KeyType: HASH
+      SSESpecification:
+        KMSMasterKeyId: !Ref TokenVaultKey
+        SSEEnabled: true
+        SSEType: KMS
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      TableName: !Ref TokensTableName
+  DataReplicationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: DataReplicationFunction/
+      Environment:
+        Variables:
+          DESTINATION_BUCKET: !Ref DataDestinationBucket
+          SENSIBLE_KEY_ID: !GetAtt SensibleDataKey.Arn
+      Events:
+        TokensStream:
+          Type: DynamoDB
+          Properties:
+            BatchSize: 100
+            BisectBatchOnFunctionError: true
+            Enabled: true
+            DestinationConfig:
+              OnFailure:
+                Destination: !GetAtt FailuresDLQ.Arn
+            StartingPosition: TRIM_HORIZON
+            Stream: !GetAtt TokenVaultTable.StreamArn
+      Handler: aws.workshop.App::handleRequest
+      MemorySize: 256
+      Role: !GetAtt DataReplicationFunctionRole.Arn
+      Runtime: java11
+  DataUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: DataUploadFunction/
+      Environment:
+        Variables:
+          TOKEN_VAULT_TABLE: !Ref TokensTableName
+          DESTINATION_BUCKET: !Ref DataDestinationBucket
+      Events:
+        Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref DataUploadBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+      Handler: aws.workshop.App::handleRequest
+      MemorySize: 512
+      Role: !GetAtt DataUploadFunctionRole.Arn
+      Runtime: java11

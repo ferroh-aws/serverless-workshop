@@ -1,0 +1,68 @@
+package aws.workshop;
+
+import com.amazonaws.services.lambda.runtime.Context;
+import com.amazonaws.services.lambda.runtime.RequestHandler;
+import com.amazonaws.services.lambda.runtime.events.DynamodbEvent;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.PutObjectResponse;
+import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
+
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.file.Path;
+import java.util.UUID;
+
+public class App implements RequestHandler<DynamodbEvent, String> {
+    /** Logger. */
+    private static final Logger LOGGER = LoggerFactory.getLogger(App.class);
+    /** Nombre del bucket de destino. */
+    private static final String DESTINATION_BUCKET = System.getenv("DESTINATION_BUCKET");
+    /** Identificador de llave para datos sensibles. */
+    private static final String SENSIBLE_KEY_ID = System.getenv("SENSIBLE_KEY_ID");
+    /** Cliente de Amazon Simple Storage Service. */
+    private static final S3Client s3Client = S3Client.create();
+
+    /**
+     * Handles a Lambda Function request
+     *
+     * @param input   The Lambda Function input
+     * @param context The Lambda execution environment context object.
+     * @return The Lambda Function output
+     */
+    @Override
+    public String handleRequest(final DynamodbEvent input, final Context context) {
+        LOGGER.debug("Procesando registros");
+        final String fileName = System.getProperty("java.io.tmpdir") + "/" + UUID.randomUUID() + ".csv";
+        try (
+                final FileWriter fileWriter = new FileWriter(fileName);
+                final BufferedWriter writer = new BufferedWriter(fileWriter);
+                ) {
+            writer.write("account,token\n");
+            for (final DynamodbEvent.DynamodbStreamRecord record : input.getRecords()) {
+                writer.append(record.getDynamodb().getKeys().get("account").getS())
+                        .append(',')
+                        .append(record.getDynamodb().getNewImage().get("token").getS())
+                        .append('\n');
+            }
+        } catch (final IOException ex) {
+            LOGGER.error("Error al procesar registros", ex);
+            throw new RuntimeException("Error al procesar registros", ex);
+        }
+        final PutObjectResponse putObjectResponse = s3Client.putObject(
+                PutObjectRequest.builder()
+                        .bucket(DESTINATION_BUCKET)
+                        .contentEncoding("UTF-8")
+                        .key("accounts_tokens/" + UUID.randomUUID() + ".csv")
+                        .serverSideEncryption(ServerSideEncryption.AWS_KMS)
+                        .ssekmsKeyId(SENSIBLE_KEY_ID)
+                        .build(),
+                Path.of(fileName)
+        );
+        LOGGER.debug("Respuesta de subir el archivo: " + putObjectResponse);
+        return "Ok";
+    }
+}
